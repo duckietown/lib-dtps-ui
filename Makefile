@@ -1,7 +1,7 @@
-tag=duckietown_pondcleaner
+tag=dtps_ui
 
-regular_packages=duckietown_pondcleaner
-test_packages=duckietown_pondcleaner_tests
+regular_packages=dtps_ui
+test_packages=dtps_ui_tests
 cover_packages=$(test_packages),$(regular_packages)
 
 
@@ -78,7 +78,7 @@ run:
 
 run-with-mounted-src:
 	mkdir -p out-docker
-	docker run -it -v $(PWD)/src:/duckietown_pondcleaner/src:ro -v $(PWD)/out-docker:/out $(tag)
+	docker run -it -v $(PWD)/src:/dtps_ui/src:ro -v $(PWD)/out-docker:/out $(tag)
 
 
 coverage-report:

@@ -1,13 +1,13 @@
 from setuptools import find_packages, setup
 
 # :==> Fill in your project data here
-package_name = '<LIBRARY_NAME>'
-library_webpage = '<LIBRARY_WEB_PAGE>'
-maintainer = '<YOUR_FULL_NAME>'
-maintainer_email = '<YOUR_EMAIL_ADDRESS>'
-short_description = '<BRIEF_DESCRIPTION>'
+package_name = 'dtps-ui'
+library_webpage = 'https://github.com/duckietown/lib-dtps-ui'
+maintainer = 'Andrea F. Daniele'
+maintainer_email = 'afdaniele@duckietown.com'
+short_description = 'Use DTPS to create dynamic web apps.'
 full_description = """
-<LONG_DESCRIPTION>
+Use DTPS to create dynamic web apps.
 """
 
 if "<" in package_name:
@@ -31,7 +31,7 @@ def get_version_from_source(filename):
     return v
 
 
-version = get_version_from_source("src/duckietown_pondcleaner/__init__.py")
+version = get_version_from_source("src/dtps_ui/__init__.py")
 
 # read project dependencies
 # NO - dependencies.txt is for testing dependiences - EVERYTHING PINNED
@@ -40,7 +40,11 @@ version = get_version_from_source("src/duckietown_pondcleaner/__init__.py")
 # with open(dependencies_file, 'rt') as fin:
 #     dependencies = list(filter(lambda line: not line.startswith('#'), fin.read().splitlines()))
 
-install_requires = []
+install_requires = [
+    "dtps_http",
+    "jinja2",
+    "watchdog",
+]
 tests_require = []
 
 # compile description
@@ -58,7 +62,7 @@ description = """
 )
 
 console_scripts = [
-    "dt-pc-demo = duckietown_pondcleaner:dt_pc_demo",
+    "dtps-ui-serve = dtps_ui.cli_serve:main",
 ]
 
 # setup package
