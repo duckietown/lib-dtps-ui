@@ -1,4 +1,5 @@
 import dataclasses
+import os
 from types import NoneType
 from typing import Union, Literal, TYPE_CHECKING, Callable, Awaitable, Dict, Tuple
 
@@ -113,9 +114,7 @@ class HTML:
 
     @classmethod
     def from_file(cls, path: str) -> 'HTML':
-        with open(path, "rt") as f:
-            content: str = f.read()
-        return HTML(content=content)
+        return cls.from_template(path, None)
 
     @classmethod
     def from_template(cls, path: str, context: dict = None) -> 'HTML':
@@ -123,9 +122,16 @@ class HTML:
         with open(path, "rt") as f:
             content = f.read()
         # apply context using jinja2
-        if context is not None:
-            template = Template(content)
-            content = template.render(**context)
+        context = context.copy() if context else {}
+        # add dtps include html
+        dtps_ui_include_fpath = os.path.join(os.path.dirname(__file__), "assets", "dtps_ui_include.html")
+        with open(dtps_ui_include_fpath, "rt") as f:
+            dtps_ui_include_html = f.read()
+        context["dtps_ui_include"] = dtps_ui_include_html
+        # render template
+        template = Template(content)
+        content = template.render(**context)
+        # return HTML
         return HTML(content=content)
 
     def to_response(self) -> web.Response:

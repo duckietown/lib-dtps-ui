@@ -8,7 +8,7 @@ import os
 from asyncio import AbstractEventLoop
 from collections import defaultdict
 from threading import RLock
-from typing import Optional, Dict, Callable, Awaitable, Iterable, List, Tuple, cast
+from typing import Optional, Dict, Callable, Awaitable, Iterable, List, Tuple, cast, Union
 
 from dtps import DTPSContext, context as dtps_context
 from dtps_http import RawData, HTTPRequest
@@ -66,11 +66,13 @@ class EventsQueue:
 
 class App:
 
-    def __init__(self, host: str, port: int, root: str = None, static_dir: str = None, loop: AbstractEventLoop = None):
+    def __init__(self, host: str, port: int, root: str = None, static_dirs: Union[str, Iterable[str]] = None,
+                 loop: AbstractEventLoop = None):
         self._host = host
         self._port = port
         self._root = (root or "").strip("/")
-        self._static_dir = static_dir
+        self._static_dirs: Iterable[str] = \
+            (static_dirs if isinstance(static_dirs, list) else [static_dirs]) if static_dirs else None
         self._root_cxt: Optional[DTPSContext] = None
         self._loop = loop or asyncio.get_event_loop()
         self._routes: Dict[Path, DTPSContext] = {}
@@ -90,16 +92,17 @@ class App:
 
     async def _run(self):
         # load static files
-        if self._static_dir is not None:
-            for file in glob.glob(os.path.join(self._static_dir, "**", "*"), recursive=True):
-                rel_path: str = os.path.relpath(file, self._static_dir)
-                route: DTPSContext = await (self._root_cxt / "static" / rel_path).queue_create()
-                self._routes[rel_path] = route
-                with open(file, "rb") as f:
-                    data: bytes = f.read()
-                    mime: str = mimetypes.guess_type(file)[0]
-                    await route.publish(RawData(content=data, content_type=mime or "application/octet-stream"))
-                setup_file_watcher(file, route, self._loop)
+        if self._static_dirs is not None:
+            for static_dir in self._static_dirs:
+                for file in glob.glob(os.path.join(static_dir, "**", "*"), recursive=True):
+                    rel_path: str = os.path.relpath(file, static_dir)
+                    route: DTPSContext = await (self._root_cxt / "static" / rel_path).queue_create()
+                    self._routes[rel_path] = route
+                    with open(file, "rb") as f:
+                        data: bytes = f.read()
+                        mime: str = mimetypes.guess_type(file)[0]
+                        await route.publish(RawData(content=data, content_type=mime or "application/octet-stream"))
+                    setup_file_watcher(file, route, self._loop)
         # load dtps_ui assets
         assets_dir: str = os.path.join(os.path.dirname(__file__), "assets")
         for file in glob.glob(os.path.join(assets_dir, "**", "*"), recursive=True):
