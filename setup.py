@@ -75,6 +75,15 @@ setup(
     install_requires=install_requires,
     package_dir={"": "src"},
     packages=find_packages("./src"),
+    package_data={
+        'dtps_ui': [
+            'assets/*',
+            'assets/*/*',
+            'assets/*/*/*',
+            'assets/*/*/*/*',
+        ],
+    },
+    include_package_data=True,
     long_description=description,
     version=version,
     entry_points={"console_scripts": console_scripts},
