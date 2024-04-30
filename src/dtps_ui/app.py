@@ -145,6 +145,7 @@ class App:
         # create the events queue handler object
         events_queue = EventsQueue(state_cxt, our_events_cxt, self._loop)
         self._event_queues[path] = events_queue
+        return events_queue
 
     def publish_events(self, path: str, evts: Iterable[Event]):
         self._loop.create_task(task(self.apublish_events(path, evts)))
