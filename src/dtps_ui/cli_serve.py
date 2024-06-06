@@ -32,7 +32,7 @@ def main():
 
     logger.setLevel(args.log_level)
 
-    app = App(host=args.host, port=args.port, root=args.root, static_dir=args.static_dir)
+    app = App(host=args.host, port=args.port, root=args.root, static_dirs=args.static_dir)
 
     @app.route("/")
     async def index(request: HTTPRequest) -> HTML:

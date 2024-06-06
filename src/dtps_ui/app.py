@@ -17,6 +17,7 @@ from .utils import task, setup_file_watcher
 
 
 Path = str
+Selector = str
 Key = str
 
 
@@ -77,7 +78,8 @@ class App:
         self._loop = loop or asyncio.get_event_loop()
         self._routes: Dict[Path, DTPSContext] = {}
         self._event_queues: Dict[Path, EventsQueue] = {}
-        self._event_listeners: Dict[Tuple[Path, EventType, Key], List[Callable[[Event], Awaitable]]] = defaultdict(list)
+        self._event_listeners: Dict[Tuple[Path, Selector, EventType, Key], List[Callable[[Event], Awaitable]]] = \
+            defaultdict(list)
         self._ready: asyncio.Event = asyncio.Event()
 
     async def astart(self):
@@ -105,6 +107,7 @@ class App:
                     setup_file_watcher(file, route, self._loop)
         # load dtps_ui assets
         assets_dir: str = os.path.join(os.path.dirname(__file__), "assets")
+        # noinspection PyUnresolvedReferences
         for file in glob.glob(os.path.join(assets_dir, "**", "*"), recursive=True):
             rel_path: str = os.path.relpath(file, assets_dir)
             route: DTPSContext = await (self._root_cxt / "assets" / rel_path).queue_create()
@@ -147,29 +150,32 @@ class App:
         self._event_queues[path] = events_queue
         return events_queue
 
-    def publish_events(self, path: str, evts: Iterable[Event]):
+    def publish_events(self, path: Path, evts: Iterable[Event]):
         self._loop.create_task(task(self.apublish_events(path, evts)))
 
-    async def apublish_events(self, path: str, evts: Iterable[Event]):
+    async def apublish_events(self, path: Path, evts: Iterable[Event]):
         evt_queue: EventsQueue = await self.event_queue(path)
         await evt_queue.publish(evts)
 
-    def listen_for(self, path: str, event: EventType, key: str, value: ValuePattern, handler: Callable[[Event], Awaitable]) -> None:
+    def listen_for(self, path: Path, selector: Selector, event: EventType, key: str, value: ValuePattern,
+                   handler: Callable[[Event], Awaitable]) -> None:
         # return key
         rkey: str = f"{key}|{value or ''}"
-        self._event_listeners[(path, event, rkey)].append(handler)
+        self._event_listeners[(path, selector, event, rkey)].append(handler)
 
-    async def _process_events(self, path: str, evts: Iterable[Event]):
+    async def _process_events(self, path: Path, evts: Iterable[Event]):
         for evt in evts:
-            handlers: List[Callable[[Event], Awaitable]] = self._event_listeners.get((path, evt.type, evt.key), [])
+            handlers: List[Callable[[Event], Awaitable]] = self._event_listeners.get(
+                (path, evt.selector, evt.type, evt.key), []
+            )
             for handler in handlers:
                 await handler(evt)
 
-    async def atomic(self, path: str):
+    async def atomic(self, path: Path):
         evt_queue: EventsQueue = await self.event_queue(path)
         return evt_queue.atomic
 
-    def route(self, path: str):
+    def route(self, path: Path):
         if path in self._routes:
             raise ValueError(f"Route {path} already exists")
 
@@ -203,7 +209,7 @@ class App:
 
         self._loop.create_task(task(_setup_background_task()))
 
-    def frontend(self, path: str) -> FrontEnd:
+    def frontend(self, path: Path) -> FrontEnd:
         return FrontEnd.get(self, path)
 
     def serve_forever(self):

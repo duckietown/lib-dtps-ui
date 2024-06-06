@@ -94,7 +94,7 @@ class Element:
         Register a handler for an event.
         """
         # register listener with the app
-        self._app.listen_for(self._path, "action", key, value, handler)
+        self._app.listen_for(self._path, self._selector, "action", key, value, handler)
         # register listener on the frontend
         self._app.publish_events(self._path, [Event(type="register", selector=self._selector, key=key, value=value)])
 
