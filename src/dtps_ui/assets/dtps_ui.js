@@ -119,7 +119,7 @@ function on_unregister_event(evt) {
 }
 
 function on_update_event(evt) {
-    if (evt.key === "body") {
+    if (evt.key === "innerHTML" || evt.key === "innerText") {
         $(selector(evt)).html(evt.value);
     } else {
         $(selector(evt)).attr(evt.key, evt.value);
