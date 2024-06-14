@@ -114,10 +114,10 @@ class HTML:
 
     @classmethod
     def from_file(cls, path: str) -> 'HTML':
-        return cls.from_template(path, None)
+        return cls.from_template(path)
 
     @classmethod
-    def from_template(cls, path: str, context: dict = None) -> 'HTML':
+    def from_template(cls, path: str, *, context: dict = None, route: str = "/") -> 'HTML':
         content: str
         with open(path, "rt") as f:
             content = f.read()
@@ -127,6 +127,11 @@ class HTML:
         dtps_ui_include_fpath = os.path.join(os.path.dirname(__file__), "assets", "dtps_ui_include.html")
         with open(dtps_ui_include_fpath, "rt") as f:
             dtps_ui_include_html = f.read()
+        # find relative path to the template
+        dtps_ui_assets_dir = "./"
+        levels: int = route.strip("/").count("/")
+        dtps_ui_assets_dir += "../" * (levels + 1 if levels > 0 else 0)
+        dtps_ui_include_html = Template(dtps_ui_include_html).render(dtps_ui_assets_dir=dtps_ui_assets_dir)
         context["dtps_ui_include"] = dtps_ui_include_html
         # render template
         template = Template(content)
