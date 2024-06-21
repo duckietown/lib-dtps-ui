@@ -45,8 +45,6 @@ async def update():
 
     while True:
         i += 0.01
-        # fe.element("#third-item-price").body = f"${i:.2f}"
-        # fe.element("#third-item-price").style.color = ("red" if (int(i * 100) % 2) == 0 else "black")
 
         fe.element("img.d-block.mx-auto.mb-4").style.left = f"{int(200 * math.sin(3 * i))}px"
 
