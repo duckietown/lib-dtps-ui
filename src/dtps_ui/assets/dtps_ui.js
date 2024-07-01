@@ -134,6 +134,10 @@ function on_action_event(evt) {
     console.log("Not implemented: on_action_event");
 }
 
+function on_trigger_event(evt) {
+    $(selector(evt)).trigger(evt.key, evt.value);
+}
+
 function process_events(evts) {
     // process the events
     for (let evt of evts) {
@@ -147,6 +151,8 @@ function process_events(evts) {
             on_style_event(evt);
         } else if (evt.type === "action") {
             on_action_event(evt);
+        } else if (evt.type === "trigger") {
+            on_trigger_event(evt);
         } else {
             console.log("Unknown event type: " + evt.type);
         }

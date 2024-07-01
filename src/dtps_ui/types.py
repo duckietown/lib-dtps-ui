@@ -9,7 +9,7 @@ from jinja2 import Template
 from dtps_http import RawData, HTTPResponse
 
 Response = Union[RawData, HTTPResponse, 'HTML']
-EventType = Literal["register", "unregister", "update", "style", "action"]
+EventType = Literal["register", "unregister", "update", "style", "action", "trigger"]
 ValueType = Union[int, float, str, list, dict, None]
 AllowedValueTypes = (int, float, str, list, dict, NoneType)
 ValuePattern = str
