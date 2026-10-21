@@ -5,11 +5,16 @@
 //  - `tobackend`   (actions raised by the page, delivered to the backend)
 //
 // Both sockets reconnect automatically (with exponential backoff) when they drop, e.g. after the
-// backend restarts or the browser suspends a background tab. While the connection is down, the
-// page is flagged (see `dtps_ui.connected` below) and actions are dropped rather than queued, so
-// that stale inputs (e.g. a key press from minutes ago) are never replayed on reconnect.
-// When `frombackend` reconnects, the full state is re-fetched from the backend, so that any event
-// published while the page was disconnected is not lost.
+// backend restarts or the browser suspends a background tab. While either socket is down, the
+// page is flagged (see `dtps_ui.connected` below).
+//
+// Actions are dropped (not queued) only while `tobackend` is down, so that stale inputs (e.g. a
+// key press from minutes ago) are never replayed on reconnect. They are deliberately still sent
+// when only `frombackend` is down: a command that can be delivered (e.g. an emergency stop) must
+// not be blocked because the page cannot currently receive updates.
+//
+// When `frombackend` reconnects, the state is re-fetched from the backend and the entries that
+// changed while the page was disconnected are applied; one-shot `trigger` events are not replayed.
 
 const dtps_ui_base_path = window.location.pathname.replace(/^\/|\/$/g, '');
 const frombackend_ws_url =
@@ -137,7 +142,8 @@ Object.byString = function(o, s) {
     return o;
 }
 
-// deliver an action to the backend; dropped (with a warning) while disconnected
+// deliver an action to the backend; dropped (with a warning) while the `tobackend` socket is down.
+// NOTE: this intentionally ignores the state of `frombackend` (see the header comment).
 function send_to_backend(evts) {
     if (tobackend === null || tobackend.readyState !== WebSocket.OPEN) {
         console.warn("dtps_ui: backend not connected, dropping event(s)", evts);
@@ -154,20 +160,48 @@ function send_to_backend(evts) {
     return true;
 }
 
-// listeners already registered, so that re-applying the state on reconnect does not bind them twice
-let _registered_listeners = new Set();
+// every registration received so far, so that listeners can be re-bound when the elements they
+// were bound to are replaced (e.g. by an `innerHTML` update)
+let _registrations = new Map();
 
 function on_register_event(evt) {
     let registration_key = evt.selector + "|" + evt.key + "|" + (evt.value === null ? "" : evt.value);
-    if (_registered_listeners.has(registration_key)) {
-        return;
+    _registrations.set(registration_key, evt);
+    _bind_registration(registration_key, evt, false);
+}
+
+// re-bind the registrations whose elements were replaced (already bound elements are skipped)
+function _rebind_registrations() {
+    for (const [registration_key, evt] of _registrations) {
+        _bind_registration(registration_key, evt, true);
     }
+}
+
+function _bind_registration(registration_key, evt, quiet) {
     let target = $(selector(evt));
     if (target.length === 0) {
-        console.warn("dtps_ui: cannot register '" + evt.key + "' on '" + evt.selector + "': element not found");
+        if (!quiet) {
+            console.warn("dtps_ui: cannot register '" + evt.key + "' on '" + evt.selector + "': element not found");
+        }
         return;
     }
-    _registered_listeners.add(registration_key);
+    // the set of registrations bound to each element lives on the element itself, so that a
+    // re-applied registration never binds twice, while a replaced element gets bound again
+    target.each((_, element) => {
+        let bound = _jq.data(element, "dtps_ui_bound");
+        if (bound === undefined) {
+            bound = new Set();
+            _jq.data(element, "dtps_ui_bound", bound);
+        }
+        if (bound.has(registration_key)) {
+            return;
+        }
+        bound.add(registration_key);
+        _bind_listener(_jq(element), evt);
+    });
+}
+
+function _bind_listener(target, evt) {
     target.on(evt.key, async (action) => {
         // navigate to the action path
         if (evt.value !== null) {
@@ -197,6 +231,10 @@ function on_unregister_event(evt) {
 function on_update_event(evt) {
     if (evt.key === "innerHTML" || evt.key === "innerText") {
         $(selector(evt)).html(evt.value);
+        // the subtree was replaced: cached selections may now point to detached elements, and
+        // listeners bound inside the subtree are gone
+        _jquery_cache = {};
+        _rebind_registrations();
     } else {
         $(selector(evt)).attr(evt.key, evt.value);
     }
@@ -214,7 +252,15 @@ function on_trigger_event(evt) {
     $(selector(evt)).trigger(evt.key, evt.value);
 }
 
+// the last applied version of each state entry (same key as the backend's `__state__` entries)
+let _applied_state = new Map();
+
+function _state_key(evt) {
+    return evt.type + "|" + evt.selector + "|" + evt.key;
+}
+
 function process_event(evt) {
+    _applied_state.set(_state_key(evt), JSON.stringify(evt));
     if (evt.type === "register") {
         on_register_event(evt);
     } else if (evt.type === "unregister") {
@@ -250,17 +296,41 @@ function process_events(evts) {
 // applied right after the state, so that nothing is lost or applied out of order
 let _state_synced = false;
 let _pending_events = [];
+// incremented by every sync; a sync whose response arrives after a newer sync started is discarded
+let _sync_generation = 0;
 
-async function sync_state() {
+// returns the state entries to apply: all of them on the first sync; on a re-sync only those that
+// changed since they were last applied, without one-shot triggers (they were delivered, or are stale)
+function _entries_to_apply(evts, resync) {
+    if (!resync) {
+        return evts;
+    }
+    let entries = evts.filter((evt) => evt.type !== "trigger");
+    let changed = entries.filter((evt) => _applied_state.get(_state_key(evt)) !== JSON.stringify(evt));
+    // a changed `innerHTML`/`innerText` recreates the elements it contains, together with the state
+    // previously applied to them: replay everything in that case
+    let html_changed = changed.some(
+        (evt) => evt.type === "update" && (evt.key === "innerHTML" || evt.key === "innerText")
+    );
+    return html_changed ? entries : changed;
+}
+
+async function sync_state(resync = false) {
+    const generation = ++_sync_generation;
     _state_synced = false;
     console.log("Fetching state from '" + state_url + "' ...");
     let state = await fetch(state_url, {cache: "no-store"});
     let json = await state.json();
+    if (generation !== _sync_generation) {
+        console.log("dtps_ui: discarding a superseded state response");
+        return;
+    }
     // process the events defining the state
-    for (let evt of Object.values(json)) {
+    let entries = _entries_to_apply(Object.values(json), resync);
+    for (let evt of entries) {
         process_events([evt]);
     }
-    console.log("State processed.");
+    console.log("State processed (" + entries.length + " entries applied).");
     // apply the events that arrived in the meantime
     _state_synced = true;
     let pending = _pending_events;
@@ -323,7 +393,7 @@ function connect_frombackend() {
         if (_frombackend_ever_connected) {
             // reconnection: events published while we were away were missed, re-sync the state
             try {
-                await sync_state();
+                await sync_state(true);
             } catch (e) {
                 console.error("dtps_ui: failed to re-sync the state, closing to retry", e);
                 ws.close();
