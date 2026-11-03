@@ -1,34 +1,94 @@
+// dtps_ui frontend runtime
+//
+// Keeps two websockets open with the backend:
+//  - `frombackend` (events published by the backend, applied to the page)
+//  - `tobackend`   (actions raised by the page, delivered to the backend)
+//
+// Both sockets reconnect automatically (with exponential backoff) when they drop, e.g. after the
+// backend restarts or the browser suspends a background tab. While either socket is down, the
+// page is flagged (see `dtps_ui.connected` below).
+//
+// Actions are dropped (not queued) only while `tobackend` is down, so that stale inputs (e.g. a
+// key press from minutes ago) are never replayed on reconnect. They are deliberately still sent
+// when only `frombackend` is down: a command that can be delivered (e.g. an emergency stop) must
+// not be blocked because the page cannot currently receive updates.
+//
+// When `frombackend` reconnects, the state is re-fetched from the backend and the entries that
+// changed while the page was disconnected are applied; one-shot `trigger` events are not replayed.
+
+const dtps_ui_base_path = window.location.pathname.replace(/^\/|\/$/g, '');
 const frombackend_ws_url =
-    "ws://" + window.location.host + "/" + window.location.pathname.replace(/^\/|\/$/g, '') + "/__frombackend__/:events/?send_data=true";
-console.log("Connecting to backend WS at " + frombackend_ws_url + " ...")
-
-const frombackend = new WebSocket(frombackend_ws_url);
-frombackend.binaryType = "arraybuffer";
-
-frombackend.onopen = () => {
-    console.log("Connected to backend WS at " + frombackend_ws_url);
-};
-
-frombackend.onclose = () => {
-    console.log("Disconnected from backend WS at " + frombackend_ws_url);
-};
-
-
-
+    "ws://" + window.location.host + "/" + dtps_ui_base_path + "/__frombackend__/:events/?send_data=true";
 const tobackend_ws_url =
-    "ws://" + window.location.host + "/" + window.location.pathname.replace(/^\/|\/$/g, '') + "/__tobackend__/:push/";
-console.log("Connecting to frontend WS at " + tobackend_ws_url + " ...")
+    "ws://" + window.location.host + "/" + dtps_ui_base_path + "/__tobackend__/:push/";
+const state_url =
+    window.location.protocol + "//" + window.location.host + "/" + dtps_ui_base_path + "/__state__/";
 
-const tobackend = new WebSocket(tobackend_ws_url);
-tobackend.binaryType = "arraybuffer";
+const DTPS_UI_RECONNECT_MIN_MS = 500;
+const DTPS_UI_RECONNECT_MAX_MS = 5000;
 
-tobackend.onopen = () => {
-    console.log("Connected to frontend WS server at " + tobackend_ws_url);
+let frombackend = null;
+let tobackend = null;
+
+// connection status, exposed to the page as `dtps_ui.connected`
+const dtps_ui = {
+    connected: false,
+    frombackend_connected: false,
+    tobackend_connected: false,
+    // listeners notified with the new value of `connected`
+    on_connection_change: [],
 };
+window.dtps_ui = dtps_ui;
 
-tobackend.onclose = () => {
-    console.log("Disconnected from frontend WS server at " + tobackend_ws_url);
-};
+function _apply_connection_status() {
+    const connected = dtps_ui.connected;
+    if (document.body) {
+        document.body.classList.toggle("dtps-ui-disconnected", !connected);
+        document.body.setAttribute("data-dtps-ui-connected", connected ? "true" : "false");
+    }
+    _show_disconnected_banner(!connected);
+}
+
+function _update_connection_status() {
+    const connected = dtps_ui.frombackend_connected && dtps_ui.tobackend_connected;
+    if (connected === dtps_ui.connected) {
+        return;
+    }
+    dtps_ui.connected = connected;
+    _apply_connection_status();
+    for (const listener of dtps_ui.on_connection_change) {
+        try {
+            listener(connected);
+        } catch (e) {
+            console.error("dtps_ui: error in connection listener", e);
+        }
+    }
+}
+
+function _show_disconnected_banner(show) {
+    let banner = document.getElementById("dtps_ui_disconnected_banner");
+    if (!show) {
+        if (banner) {
+            banner.remove();
+        }
+        return;
+    }
+    if (banner || !document.body) {
+        return;
+    }
+    banner = document.createElement("div");
+    banner.id = "dtps_ui_disconnected_banner";
+    banner.textContent = "Connection to the backend lost. Reconnecting...";
+    banner.style.cssText =
+        "position:fixed;top:0;left:0;right:0;z-index:100000;padding:6px 12px;" +
+        "background:#b02a37;color:#fff;font:14px sans-serif;text-align:center;";
+    document.body.appendChild(banner);
+}
+
+// grows from MIN to MAX, reset on a successful connection
+function _next_delay(current) {
+    return Math.min(current * 2, DTPS_UI_RECONNECT_MAX_MS);
+}
 
 
 // Cached JQuery
@@ -46,6 +106,9 @@ function _jqq(s)  {
     if(e.length > 0) {
         return _jq(_jquery_cache[s] = e);
     }
+
+    // no match (yet): return the empty selection instead of `undefined` so that callers do not throw
+    return e;
 }
 
 $ = _jqq;
@@ -79,9 +142,67 @@ Object.byString = function(o, s) {
     return o;
 }
 
+// deliver an action to the backend; dropped (with a warning) while the `tobackend` socket is down.
+// NOTE: this intentionally ignores the state of `frombackend` (see the header comment).
+function send_to_backend(evts) {
+    if (tobackend === null || tobackend.readyState !== WebSocket.OPEN) {
+        console.warn("dtps_ui: backend not connected, dropping event(s)", evts);
+        return false;
+    }
+    // encode the events as a CBOR payload
+    let data = CBOR.encode({
+        RawData: {
+            content: JSON.stringify(evts),
+            content_type: "application/json"
+        }
+    });
+    tobackend.send(data);
+    return true;
+}
+
+// every registration received so far, so that listeners can be re-bound when the elements they
+// were bound to are replaced (e.g. by an `innerHTML` update)
+let _registrations = new Map();
 
 function on_register_event(evt) {
-    $(selector(evt)).on(evt.key, async (action) => {
+    let registration_key = evt.selector + "|" + evt.key + "|" + (evt.value === null ? "" : evt.value);
+    _registrations.set(registration_key, evt);
+    _bind_registration(registration_key, evt, false);
+}
+
+// re-bind the registrations whose elements were replaced (already bound elements are skipped)
+function _rebind_registrations() {
+    for (const [registration_key, evt] of _registrations) {
+        _bind_registration(registration_key, evt, true);
+    }
+}
+
+function _bind_registration(registration_key, evt, quiet) {
+    let target = $(selector(evt));
+    if (target.length === 0) {
+        if (!quiet) {
+            console.warn("dtps_ui: cannot register '" + evt.key + "' on '" + evt.selector + "': element not found");
+        }
+        return;
+    }
+    // the set of registrations bound to each element lives on the element itself, so that a
+    // re-applied registration never binds twice, while a replaced element gets bound again
+    target.each((_, element) => {
+        let bound = _jq.data(element, "dtps_ui_bound");
+        if (bound === undefined) {
+            bound = new Set();
+            _jq.data(element, "dtps_ui_bound", bound);
+        }
+        if (bound.has(registration_key)) {
+            return;
+        }
+        bound.add(registration_key);
+        _bind_listener(_jq(element), evt);
+    });
+}
+
+function _bind_listener(target, evt) {
+    target.on(evt.key, async (action) => {
         // navigate to the action path
         if (evt.value !== null) {
             action = Object.byString(action, evt.value);
@@ -99,18 +220,7 @@ function on_register_event(evt) {
         };
 
         // events are sent as a list
-        let evts = [evt1];
-
-        // encode the event as a CBOR payload
-        let data = CBOR.encode({
-            RawData: {
-                content: JSON.stringify(evts),
-                content_type: "application/json"
-            }
-        });
-
-        // send the event to the backend
-        tobackend.send(data);
+        send_to_backend([evt1]);
     });
 }
 
@@ -121,6 +231,10 @@ function on_unregister_event(evt) {
 function on_update_event(evt) {
     if (evt.key === "innerHTML" || evt.key === "innerText") {
         $(selector(evt)).html(evt.value);
+        // the subtree was replaced: cached selections may now point to detached elements, and
+        // listeners bound inside the subtree are gone
+        _jquery_cache = {};
+        _rebind_registrations();
     } else {
         $(selector(evt)).attr(evt.key, evt.value);
     }
@@ -138,63 +252,230 @@ function on_trigger_event(evt) {
     $(selector(evt)).trigger(evt.key, evt.value);
 }
 
+// the last applied version of each state entry (same key as the backend's `__state__` entries)
+let _applied_state = new Map();
+
+function _state_key(evt) {
+    return evt.type + "|" + evt.selector + "|" + evt.key;
+}
+
+function process_event(evt) {
+    _applied_state.set(_state_key(evt), JSON.stringify(evt));
+    if (evt.type === "register") {
+        on_register_event(evt);
+    } else if (evt.type === "unregister") {
+        on_unregister_event(evt);
+    } else if (evt.type === "update") {
+        on_update_event(evt);
+    } else if (evt.type === "style") {
+        on_style_event(evt);
+    } else if (evt.type === "action") {
+        on_action_event(evt);
+    } else if (evt.type === "trigger") {
+        on_trigger_event(evt);
+    } else {
+        console.log("Unknown event type: " + evt.type);
+    }
+}
+
 function process_events(evts) {
-    // process the events
+    // process the events; one faulty event must not prevent the others from being applied
     for (let evt of evts) {
-        if (evt.type === "register") {
-            on_register_event(evt);
-        } else if (evt.type === "unregister") {
-            on_unregister_event(evt);
-        } else if (evt.type === "update") {
-            on_update_event(evt);
-        } else if (evt.type === "style") {
-            on_style_event(evt);
-        } else if (evt.type === "action") {
-            on_action_event(evt);
-        } else if (evt.type === "trigger") {
-            on_trigger_event(evt);
-        } else {
-            console.log("Unknown event type: " + evt.type);
+        try {
+            process_event(evt);
+        } catch (e) {
+            console.error("dtps_ui: error while processing event", evt, e);
         }
     }
 }
 
 
-// Websocket events listener
+// State synchronization
 
-$(document).ready(async () => {
-    let state_url =
-        window.location.protocol + "//" + window.location.host + "/" + window.location.pathname.replace(/^\/|\/$/g, '') + "/__state__/";
+// events received from `frombackend` while the state is being (re)fetched are held here and
+// applied right after the state, so that nothing is lost or applied out of order
+let _state_synced = false;
+let _pending_events = [];
+// incremented by every sync; a sync whose response arrives after a newer sync started is discarded
+let _sync_generation = 0;
 
-    console.log("Fetching initial state from '" + state_url + "' ...")
-    // fetch the initial state
-    let state = await fetch(state_url);
+// returns the state entries to apply: all of them on the first sync; on a re-sync only those that
+// changed since they were last applied, without one-shot triggers (they were delivered, or are stale)
+function _entries_to_apply(evts, resync) {
+    if (!resync) {
+        return evts;
+    }
+    let entries = evts.filter((evt) => evt.type !== "trigger");
+    let changed = entries.filter((evt) => _applied_state.get(_state_key(evt)) !== JSON.stringify(evt));
+    // a changed `innerHTML`/`innerText` recreates the elements it contains, together with the state
+    // previously applied to them: replay everything in that case
+    let html_changed = changed.some(
+        (evt) => evt.type === "update" && (evt.key === "innerHTML" || evt.key === "innerText")
+    );
+    return html_changed ? entries : changed;
+}
+
+async function sync_state(resync = false) {
+    const generation = ++_sync_generation;
+    _state_synced = false;
+    console.log("Fetching state from '" + state_url + "' ...");
+    let state = await fetch(state_url, {cache: "no-store"});
     let json = await state.json();
-
-    // process the events defining in the initial state
-    for (let evt of Object.values(json)) {
+    if (generation !== _sync_generation) {
+        console.log("dtps_ui: discarding a superseded state response");
+        return;
+    }
+    // process the events defining the state
+    let entries = _entries_to_apply(Object.values(json), resync);
+    for (let evt of entries) {
         process_events([evt]);
     }
-    console.log("Initial state processed.")
-
-    console.log("Listening for events ...")
-    let text_decoder = new TextDecoder("utf-8");
-    frombackend.onmessage = (msg) => {
-        // decode CBOR message
-        let payload = CBOR.decode(msg.data);
-
-        // messages of type "Chunk" are used to send data payloads
-        if (!("Chunk" in payload)) {
-            return;
-        }
-
-        // decode the Chunk payload
-        let json = text_decoder.decode(payload.Chunk.data);
-
-        // parse the JSON payload
-        let evts = JSON.parse(json);
-
-        // process the events
+    console.log("State processed (" + entries.length + " entries applied).");
+    // apply the events that arrived in the meantime
+    _state_synced = true;
+    let pending = _pending_events;
+    _pending_events = [];
+    for (let evts of pending) {
         process_events(evts);
+    }
+}
+
+
+// Websockets
+
+const _text_decoder = new TextDecoder("utf-8");
+
+function _on_frombackend_message(msg) {
+    // decode CBOR message
+    let payload = CBOR.decode(msg.data);
+
+    // messages of type "Chunk" are used to send data payloads
+    if (!("Chunk" in payload)) {
+        return;
+    }
+
+    // decode the Chunk payload
+    let json = _text_decoder.decode(payload.Chunk.data);
+
+    // parse the JSON payload
+    let evts = JSON.parse(json);
+
+    if (!_state_synced) {
+        _pending_events.push(evts);
+        return;
+    }
+
+    // process the events
+    process_events(evts);
+}
+
+let _frombackend_delay = DTPS_UI_RECONNECT_MIN_MS;
+let _frombackend_ever_connected = false;
+let _frombackend_timer = null;
+
+function connect_frombackend() {
+    clearTimeout(_frombackend_timer);
+    _frombackend_timer = null;
+    if (frombackend !== null && frombackend.readyState <= WebSocket.OPEN) {
+        // already connecting or connected
+        return;
+    }
+    console.log("Connecting to backend WS at " + frombackend_ws_url + " ...");
+    let ws = new WebSocket(frombackend_ws_url);
+    ws.binaryType = "arraybuffer";
+    frombackend = ws;
+
+    ws.onopen = async () => {
+        console.log("Connected to backend WS at " + frombackend_ws_url);
+        _frombackend_delay = DTPS_UI_RECONNECT_MIN_MS;
+        dtps_ui.frombackend_connected = true;
+        _update_connection_status();
+        if (_frombackend_ever_connected) {
+            // reconnection: events published while we were away were missed, re-sync the state
+            try {
+                await sync_state(true);
+            } catch (e) {
+                console.error("dtps_ui: failed to re-sync the state, closing to retry", e);
+                ws.close();
+            }
+        }
+        _frombackend_ever_connected = true;
     };
+
+    ws.onmessage = _on_frombackend_message;
+
+    ws.onerror = (e) => {
+        console.warn("dtps_ui: backend WS error", e);
+    };
+
+    ws.onclose = () => {
+        console.log("Disconnected from backend WS at " + frombackend_ws_url +
+                    ", reconnecting in " + _frombackend_delay + "ms");
+        dtps_ui.frombackend_connected = false;
+        _update_connection_status();
+        if (frombackend === ws && _frombackend_timer === null) {
+            _frombackend_timer = setTimeout(connect_frombackend, _frombackend_delay);
+            _frombackend_delay = _next_delay(_frombackend_delay);
+        }
+    };
+}
+
+let _tobackend_delay = DTPS_UI_RECONNECT_MIN_MS;
+let _tobackend_timer = null;
+
+function connect_tobackend() {
+    clearTimeout(_tobackend_timer);
+    _tobackend_timer = null;
+    if (tobackend !== null && tobackend.readyState <= WebSocket.OPEN) {
+        // already connecting or connected
+        return;
+    }
+    console.log("Connecting to frontend WS at " + tobackend_ws_url + " ...");
+    let ws = new WebSocket(tobackend_ws_url);
+    ws.binaryType = "arraybuffer";
+    tobackend = ws;
+
+    ws.onopen = () => {
+        console.log("Connected to frontend WS server at " + tobackend_ws_url);
+        _tobackend_delay = DTPS_UI_RECONNECT_MIN_MS;
+        dtps_ui.tobackend_connected = true;
+        _update_connection_status();
+    };
+
+    ws.onerror = (e) => {
+        console.warn("dtps_ui: frontend WS error", e);
+    };
+
+    ws.onclose = () => {
+        console.log("Disconnected from frontend WS server at " + tobackend_ws_url +
+                    ", reconnecting in " + _tobackend_delay + "ms");
+        dtps_ui.tobackend_connected = false;
+        _update_connection_status();
+        if (tobackend === ws && _tobackend_timer === null) {
+            _tobackend_timer = setTimeout(connect_tobackend, _tobackend_delay);
+            _tobackend_delay = _next_delay(_tobackend_delay);
+        }
+    };
+}
+
+// open the sockets right away so that no event is missed while the page finishes loading
+connect_frombackend();
+connect_tobackend();
+
+// when a suspended tab comes back, do not wait for the backoff timer
+document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState !== "visible") {
+        return;
+    }
+    connect_frombackend();
+    connect_tobackend();
+});
+
+
+// Initial state
+
+$(document).ready(async () => {
+    await sync_state();
+    _apply_connection_status();
+    console.log("Listening for events ...");
 });
