@@ -295,9 +295,18 @@ function process_events(evts) {
 // events received from `frombackend` while the state is being (re)fetched are held here and
 // applied right after the state, so that nothing is lost or applied out of order
 let _state_synced = false;
+// each entry is `{evts, digest}`: the batch itself and the identity of the chunk that carried it
 let _pending_events = [];
 // incremented by every sync; a sync whose response arrives after a newer sync started is discarded
 let _sync_generation = 0;
+
+// DTPS delivers the queue's retained last message to every new subscriber, so the first chunk of a
+// reconnected socket is often one we already applied. Re-applying state events is harmless (they are
+// assignments), but a `trigger` is one-shot: re-firing it sends a duplicate action to the backend.
+// `Chunk.digest` identifies the payload, so we drop that first chunk when it repeats the last one we
+// applied, and deliver it otherwise - a message published while we were away arrives only this way.
+let _last_chunk_digest = null;
+let _expect_retained_chunk = false;
 
 // returns the state entries to apply: all of them on the first sync; on a re-sync only those that
 // changed since they were last applied, without one-shot triggers (they were delivered, or are stale)
@@ -318,6 +327,12 @@ function _entries_to_apply(evts, resync) {
 async function sync_state(resync = false) {
     const generation = ++_sync_generation;
     _state_synced = false;
+    // events still buffered here were held for a synchronization that never completed (its fetch
+    // failed, or it was superseded). The state we are about to fetch is newer than all of them, so
+    // replaying them afterwards would overwrite the authoritative snapshot with stale values.
+    // Nothing can belong to *this* synchronization yet: we are called synchronously from `onopen`,
+    // before any message of the new socket can be handled.
+    _pending_events = [];
     console.log("Fetching state from '" + state_url + "' ...");
     let state = await fetch(state_url, {cache: "no-store"});
     let json = await state.json();
@@ -335,8 +350,10 @@ async function sync_state(resync = false) {
     _state_synced = true;
     let pending = _pending_events;
     _pending_events = [];
-    for (let evts of pending) {
-        process_events(evts);
+    for (let held of pending) {
+        // only now are these events applied, so only now does their chunk become the last one seen
+        _last_chunk_digest = held.digest;
+        process_events(held.evts);
     }
 }
 
@@ -356,16 +373,31 @@ function _on_frombackend_message(msg) {
 
     // decode the Chunk payload
     let json = _text_decoder.decode(payload.Chunk.data);
+    let digest = payload.Chunk.digest;
+
+    // only the first chunk of a connection can be the retained one; checking just that one keeps
+    // two genuinely distinct batches that happen to carry identical content from cancelling out
+    if (_expect_retained_chunk) {
+        _expect_retained_chunk = false;
+        if (digest !== undefined && digest === _last_chunk_digest) {
+            console.log("dtps_ui: ignoring the retained message replayed on reconnection");
+            return;
+        }
+    }
 
     // parse the JSON payload
     let evts = JSON.parse(json);
 
     if (!_state_synced) {
-        _pending_events.push(evts);
+        // the digest travels with the batch: it identifies the last *applied* chunk, and these
+        // events are only applied once the state has been fetched (if this sync is abandoned, they
+        // are discarded and the digest must not move)
+        _pending_events.push({evts: evts, digest: digest});
         return;
     }
 
     // process the events
+    _last_chunk_digest = digest;
     process_events(evts);
 }
 
@@ -388,6 +420,9 @@ function connect_frombackend() {
     ws.onopen = async () => {
         console.log("Connected to backend WS at " + frombackend_ws_url);
         _frombackend_delay = DTPS_UI_RECONNECT_MIN_MS;
+        // the subscription starts with the queue's retained last message, which may be one we have
+        // already applied; `_on_frombackend_message` decides by digest
+        _expect_retained_chunk = true;
         dtps_ui.frombackend_connected = true;
         _update_connection_status();
         if (_frombackend_ever_connected) {
