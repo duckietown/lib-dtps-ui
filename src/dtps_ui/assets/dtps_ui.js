@@ -295,18 +295,31 @@ function process_events(evts) {
 // events received from `frombackend` while the state is being (re)fetched are held here and
 // applied right after the state, so that nothing is lost or applied out of order
 let _state_synced = false;
-// each entry is `{evts, digest}`: the batch itself and the identity of the chunk that carried it
+// each entry is `{evts, message_id}`: the batch itself and the identity of its publication
 let _pending_events = [];
 // incremented by every sync; a sync whose response arrives after a newer sync started is discarded
 let _sync_generation = 0;
 
-// DTPS delivers the queue's retained last message to every new subscriber, so the first chunk of a
+// DTPS delivers the queue's retained last message to every new subscriber, so the first batch of a
 // reconnected socket is often one we already applied. Re-applying state events is harmless (they are
 // assignments), but a `trigger` is one-shot: re-firing it sends a duplicate action to the backend.
-// `Chunk.digest` identifies the payload, so we drop that first chunk when it repeats the last one we
-// applied, and deliver it otherwise - a message published while we were away arrives only this way.
-let _last_chunk_digest = null;
-let _expect_retained_chunk = false;
+// Each payload is announced by a `DataReady` frame naming its publication - the queue it came from
+// (`origin_node`, `unique_id`) and its position in that queue (`index`) - so a replay is recognised
+// by identity rather than by content: re-publishing the same payload is a new message and must be
+// delivered, as must anything published while we were away.
+let _current_message_id = null;        // the publication being delivered right now
+let _last_applied_message_id = null;   // the last one actually applied, kept across reconnections
+
+function _apply_batch(batch) {
+    if (batch.message_id !== null && batch.message_id === _last_applied_message_id) {
+        console.log("dtps_ui: ignoring the retained message replayed on reconnection");
+        return;
+    }
+    process_events(batch.evts);
+    // only a batch that was applied moves this: one discarded with an abandoned synchronization
+    // must not suppress its own retained copy when the retry delivers it again
+    _last_applied_message_id = batch.message_id;
+}
 
 // returns the state entries to apply: all of them on the first sync; on a re-sync only those that
 // changed since they were last applied, without one-shot triggers (they were delivered, or are stale)
@@ -351,9 +364,7 @@ async function sync_state(resync = false) {
     let pending = _pending_events;
     _pending_events = [];
     for (let held of pending) {
-        // only now are these events applied, so only now does their chunk become the last one seen
-        _last_chunk_digest = held.digest;
-        process_events(held.evts);
+        _apply_batch(held);
     }
 }
 
@@ -366,6 +377,13 @@ function _on_frombackend_message(msg) {
     // decode CBOR message
     let payload = CBOR.decode(msg.data);
 
+    // messages of type "DataReady" announce the publication that the next chunk carries
+    if ("DataReady" in payload) {
+        let ready = payload.DataReady;
+        _current_message_id = JSON.stringify([ready.origin_node, ready.unique_id, ready.index]);
+        return;
+    }
+
     // messages of type "Chunk" are used to send data payloads
     if (!("Chunk" in payload)) {
         return;
@@ -373,32 +391,20 @@ function _on_frombackend_message(msg) {
 
     // decode the Chunk payload
     let json = _text_decoder.decode(payload.Chunk.data);
-    let digest = payload.Chunk.digest;
-
-    // only the first chunk of a connection can be the retained one; checking just that one keeps
-    // two genuinely distinct batches that happen to carry identical content from cancelling out
-    if (_expect_retained_chunk) {
-        _expect_retained_chunk = false;
-        if (digest !== undefined && digest === _last_chunk_digest) {
-            console.log("dtps_ui: ignoring the retained message replayed on reconnection");
-            return;
-        }
-    }
 
     // parse the JSON payload
     let evts = JSON.parse(json);
+    // the identity travels with the batch, because a batch held while the state is being fetched is
+    // applied (or discarded) later, and only then can it count as the last one applied
+    let batch = {evts: evts, message_id: _current_message_id};
 
     if (!_state_synced) {
-        // the digest travels with the batch: it identifies the last *applied* chunk, and these
-        // events are only applied once the state has been fetched (if this sync is abandoned, they
-        // are discarded and the digest must not move)
-        _pending_events.push({evts: evts, digest: digest});
+        _pending_events.push(batch);
         return;
     }
 
     // process the events
-    _last_chunk_digest = digest;
-    process_events(evts);
+    _apply_batch(batch);
 }
 
 let _frombackend_delay = DTPS_UI_RECONNECT_MIN_MS;
@@ -420,9 +426,9 @@ function connect_frombackend() {
     ws.onopen = async () => {
         console.log("Connected to backend WS at " + frombackend_ws_url);
         _frombackend_delay = DTPS_UI_RECONNECT_MIN_MS;
-        // the subscription starts with the queue's retained last message, which may be one we have
-        // already applied; `_on_frombackend_message` decides by digest
-        _expect_retained_chunk = true;
+        // nothing of this connection has been announced yet; what was already applied is remembered
+        // in `_last_applied_message_id`, which must survive the reconnection
+        _current_message_id = null;
         dtps_ui.frombackend_connected = true;
         _update_connection_status();
         if (_frombackend_ever_connected) {

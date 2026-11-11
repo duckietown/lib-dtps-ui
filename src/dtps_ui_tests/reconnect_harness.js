@@ -91,9 +91,21 @@ function makeContext(state_responses) {
     return {ctx, dom, triggers, sockets, lastFrom, fetches: () => fetch_calls};
 }
 
-const chunk = (evts, digest) => ({
-    Chunk: {digest, i: 0, n: 1, index: 0, data: new TextEncoder().encode(JSON.stringify(evts))},
-});
+// A publication reaches a subscriber as two frames: a `DataReady` naming it, then the `Chunk` that
+// carries the bytes. `publish` delivers both, exactly as `serve_events` does.
+const QUEUE = {origin_node: "node-1", unique_id: "queue-1"};
+function publish(socket, evts, index, queue = QUEUE) {
+    const json = JSON.stringify(evts);
+    const data = new TextEncoder().encode(json);
+    // the real digest is a hash of the content, so republishing the same payload repeats it - which
+    // is exactly why a replay cannot be recognised by content
+    const digest = require("crypto").createHash("sha256").update(json).digest("hex");
+    socket.deliver({DataReady: {origin_node: queue.origin_node, unique_id: queue.unique_id,
+                                index, digest, content_length: data.length,
+                                chunks_arriving: 1, availability: [], clocks: {},
+                                content_type: "application/json", time_inserted: 0}});
+    socket.deliver({Chunk: {digest, i: 0, n: 1, index: 0, data}});
+}
 const ok = (json) => () => ({json: async () => json});
 const boom = () => () => { throw new Error("state fetch failed"); };
 const settle = () => new Promise((r) => setImmediate(r));
@@ -116,14 +128,14 @@ async function retained_trigger_is_not_replayed() {
     const s1 = h.lastFrom();
     await s1.open();
     await h.ctx.sync_state(false);            // initial sync, as page load does
-    s1.deliver(chunk(TRIG, "digest-A"));      // the trigger arrives live
+    publish(s1, TRIG, 41);                    // the trigger arrives live
     const before = h.triggers.length;
 
     s1.close();
     h.ctx.connect_frombackend();
     const s2 = h.lastFrom();
     await s2.open();                          // onopen re-syncs the state
-    s2.deliver(chunk(TRIG, "digest-A"));      // retained replay: same payload, same digest
+    publish(s2, TRIG, 41);                    // retained replay: the very same publication
     await settle();
 
     check("fires once while connected", before === 1, `got ${before}`);
@@ -131,7 +143,7 @@ async function retained_trigger_is_not_replayed() {
           `fired ${h.triggers.length} times -> duplicate action sent to the backend`);
 
     // a genuinely new trigger on that same socket must still get through
-    s2.deliver(chunk([{type: "trigger", selector: "#btn", key: "click", value: 2}], "digest-B"));
+    publish(s2, [{type: "trigger", selector: "#btn", key: "click", value: 2}], 42);
     await settle();
     check("a new trigger still fires", h.triggers.length === 2,
           `got ${h.triggers.length}, expected 2`);
@@ -149,13 +161,13 @@ async function missed_trigger_still_arrives() {
     const s1 = h.lastFrom();
     await s1.open();
     await h.ctx.sync_state(false);
-    s1.deliver(chunk(SEEN, "digest-A"));
+    publish(s1, SEEN, 41);
     s1.close();
 
     h.ctx.connect_frombackend();
     const s2 = h.lastFrom();
     await s2.open();
-    s2.deliver(chunk(MISSED, "digest-C"));    // retained, but published while we were away
+    publish(s2, MISSED, 42);                  // retained, but published while we were away
     await settle();
 
     check("the missed trigger is delivered", h.triggers.length === 2,
@@ -183,13 +195,13 @@ async function abandoned_sync_does_not_overwrite_snapshot() {
     h.ctx.connect_frombackend();              // reconnect #1: its re-sync will fail
     const s2 = h.lastFrom();
     const opening2 = s2.open();
-    s2.deliver(chunk(OLD, "digest-OLD"));     // buffered: the re-sync is in flight
+    publish(s2, OLD, 41);                     // buffered: the re-sync is in flight
     await opening2;                           // ... and then the fetch throws
 
     h.ctx.connect_frombackend();              // reconnect #2: this one succeeds
     const s3 = h.lastFrom();
     const opening3 = s3.open();
-    s3.deliver(chunk(OTHER, "digest-OTHER"));
+    publish(s3, OTHER, 42);
     await opening3;
     await settle();
 
@@ -198,10 +210,91 @@ async function abandoned_sync_does_not_overwrite_snapshot() {
           `#v shows ${JSON.stringify(shown)} -> stale UI while dtps_ui.connected is true`);
 }
 
+// The replay check must key on the publication, not on what it contains: the same trigger payload
+// published again is a new message, and a content-based check would swallow it.
+async function republished_identical_content_still_arrives() {
+    console.log("an identical payload republished under a new index still arrives");
+    const TRIG = [{type: "trigger", selector: "#btn", key: "click", value: 1}];
+    const h = makeContext([ok({}), ok({})]);
+
+    h.ctx.connect_frombackend();
+    const s1 = h.lastFrom();
+    await s1.open();
+    await h.ctx.sync_state(false);
+    publish(s1, TRIG, 41);                    // delivered live
+    s1.close();
+
+    h.ctx.connect_frombackend();
+    const s2 = h.lastFrom();
+    await s2.open();
+    publish(s2, TRIG, 42);                    // the same payload, published again while away
+    await settle();
+
+    check("the republication is delivered", h.triggers.length === 2,
+          `fired ${h.triggers.length} times, expected 2 (identical content was taken for a replay)`);
+}
+
+// Indices are only unique within a queue: a restarted backend publishes from a new queue identity
+// and starts counting again, so an index seen before is not a replay.
+async function new_queue_reusing_an_index_still_arrives() {
+    console.log("a new queue identity reusing an earlier index still arrives");
+    const TRIG = [{type: "trigger", selector: "#btn", key: "click", value: 1}];
+    const h = makeContext([ok({}), ok({})]);
+
+    h.ctx.connect_frombackend();
+    const s1 = h.lastFrom();
+    await s1.open();
+    await h.ctx.sync_state(false);
+    publish(s1, TRIG, 7);
+    s1.close();
+
+    h.ctx.connect_frombackend();
+    const s2 = h.lastFrom();
+    await s2.open();
+    publish(s2, TRIG, 7, {origin_node: "node-2", unique_id: "queue-2"});
+    await settle();
+
+    check("the other queue's message is delivered", h.triggers.length === 2,
+          `fired ${h.triggers.length} times, expected 2 (a different queue was taken for a replay)`);
+}
+
+// A batch discarded with an abandoned synchronization was never applied, so when the retry is handed
+// that same publication again it must go through: the identity only moves when a batch is applied.
+async function trigger_dropped_by_a_failed_sync_arrives_on_retry() {
+    console.log("a trigger buffered by a failed sync arrives on the retry");
+    const TRIG = [{type: "trigger", selector: "#btn", key: "click", value: 1}];
+    const h = makeContext([ok({}), boom(), ok({})]);
+
+    h.ctx.connect_frombackend();
+    const s1 = h.lastFrom();
+    await s1.open();
+    await h.ctx.sync_state(false);
+
+    s1.close();
+    h.ctx.connect_frombackend();              // reconnect #1: its re-sync will fail
+    const s2 = h.lastFrom();
+    const opening2 = s2.open();
+    publish(s2, TRIG, 41);                    // buffered, then discarded with that sync
+    await opening2;
+
+    h.ctx.connect_frombackend();              // reconnect #2: the retry succeeds
+    const s3 = h.lastFrom();
+    const opening3 = s3.open();
+    publish(s3, TRIG, 41);                    // the queue retains it and replays it to us
+    await opening3;
+    await settle();
+
+    check("it is applied once overall", h.triggers.length === 1,
+          `fired ${h.triggers.length} times, expected exactly 1`);
+}
+
 (async () => {
     await retained_trigger_is_not_replayed();
     await missed_trigger_still_arrives();
     await abandoned_sync_does_not_overwrite_snapshot();
+    await republished_identical_content_still_arrives();
+    await new_queue_reusing_an_index_still_arrives();
+    await trigger_dropped_by_a_failed_sync_arrives_on_retry();
     console.log(failures === 0 ? "\nALL CHECKS PASS" : `\n${failures} CHECK(S) FAILED`);
     process.exit(failures === 0 ? 0 : 1);
 })();
