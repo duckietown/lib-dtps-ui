@@ -47,7 +47,9 @@ class FileModifiedEventHandler(FileModifiedEvent):
             except Exception as e:
                 print(f"Error reading file: {e}")
 
-        self._loop.create_task(task(republish()))
+        # NOTE: `dispatch` runs on the watchdog observer thread, so the coroutine must be handed to the
+        #       event loop in a thread-safe way (`loop.create_task` from another thread never runs it)
+        asyncio.run_coroutine_threadsafe(task(republish()), self._loop)
 
 
 def setup_file_watcher(path: str, cxt: DTPSContext, loop: asyncio.AbstractEventLoop):
